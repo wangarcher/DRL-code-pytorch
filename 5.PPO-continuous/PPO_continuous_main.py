@@ -9,34 +9,40 @@ from ppo_continuous import PPO_continuous
 
 
 def evaluate_policy(args, env, agent, state_norm):
-    times = 3
+    """评估函数: 用确定性策略(分布均值)在评估环境里跑 times 个回合, 返回平均回合奖励
+    评估要点: ① 用均值动作不探索 ② 状态归一化 update=False(冻结统计量, 保持与训练一致的尺度)
+    """
+    times = 3  # 评估回合数(取平均以降低单回合随机性)
     evaluate_reward = 0
     for _ in range(times):
-        s = env.reset()
+        s = env.reset()  # 重置评估环境, 回到初始状态
         if args.use_state_norm:
-            s = state_norm(s, update=False)  # During the evaluating,update=False
+            s = state_norm(s, update=False)  # 评估期间不更新均值/方差, 只做变换 (Trick 2)
         done = False
         episode_reward = 0
         while not done:
-            a = agent.evaluate(s)  # We use the deterministic policy during the evaluating
+            a = agent.evaluate(s)  # 评估时用确定性策略(分布均值)
             if args.policy_dist == "Beta":
+                # Beta 分布支撑集是 (0,1), 环境动作范围是 [-max,max], 做线性映射:
+                # action = 2·(a-0.5)·max_action, 即 0→-max, 0.5→0, 1→+max
                 action = 2 * (a - 0.5) * args.max_action  # [0,1]->[-max,max]
             else:
-                action = a
-            s_, r, done, _ = env.step(action)
+                action = a  # Gaussian 分支: forward 已用 tanh·max_action 压到 [-max,max], 直接用
+            s_, r, done, _ = env.step(action)  # 环境执行动作, 返回下一状态/奖励/终止标志
             if args.use_state_norm:
-                s_ = state_norm(s_, update=False)
-            episode_reward += r
-            s = s_
+                s_ = state_norm(s_, update=False)  # 同样只变换、不更新统计量
+            episode_reward += r  # 累计本回合奖励
+            s = s_  # 状态滚动前移
         evaluate_reward += episode_reward
 
-    return evaluate_reward / times
+    return evaluate_reward / times  # 返回 times 个回合的平均奖励
 
 
 def main(args, env_name, number, seed):
-    env = gym.make(env_name)
-    env_evaluate = gym.make(env_name)  # When evaluating the policy, we need to rebuild an environment
-    # Set random seed
+    """主训练流程: 建环境 → 设随机种子 → 采样循环(攒满 batch 就 update) → 周期性评估并记录"""
+    env = gym.make(env_name)  # 训练环境
+    env_evaluate = gym.make(env_name)  # 评估环境(训练评估分开, 避免互相干扰状态)
+    # 设置随机种子(环境/动作空间/numpy/torch), 保证实验可复现
     env.seed(seed)
     env.action_space.seed(seed)
     env_evaluate.seed(seed)
@@ -44,82 +50,83 @@ def main(args, env_name, number, seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    args.state_dim = env.observation_space.shape[0]
-    args.action_dim = env.action_space.shape[0]
-    args.max_action = float(env.action_space.high[0])
-    args.max_episode_steps = env._max_episode_steps  # Maximum number of steps per episode
+    args.state_dim = env.observation_space.shape[0]  # 状态维度(如 HalfCheetah 为 17)
+    args.action_dim = env.action_space.shape[0]  # 动作维度(连续, 如 6)
+    args.max_action = float(env.action_space.high[0])  # 动作上界(Beta 映射 / Gaussian tanh 缩放都用它)
+    args.max_episode_steps = env._max_episode_steps  # 每回合最大步数(区分"真终止"和"到时截断"用)
     print("env={}".format(env_name))
     print("state_dim={}".format(args.state_dim))
     print("action_dim={}".format(args.action_dim))
     print("max_action={}".format(args.max_action))
     print("max_episode_steps={}".format(args.max_episode_steps))
 
-    evaluate_num = 0  # Record the number of evaluations
-    evaluate_rewards = []  # Record the rewards during the evaluating
-    total_steps = 0  # Record the total steps during the training
+    evaluate_num = 0  # 已评估次数
+    evaluate_rewards = []  # 每次评估的平均奖励列表
+    total_steps = 0  # 已交互的总步数
 
-    replay_buffer = ReplayBuffer(args)
-    agent = PPO_continuous(args)
+    replay_buffer = ReplayBuffer(args)  # on-policy 缓冲区(攒满 batch_size 条就更新并清零)
+    agent = PPO_continuous(args)  # PPO 智能体(内含 actor + critic + 优化器)
 
-    # Build a tensorboard
+    # 建 TensorBoard 日志, 目录含环境名/策略分布/编号/种子, 便于区分实验
     writer = SummaryWriter(log_dir='runs/PPO_continuous/env_{}_{}_number_{}_seed_{}'.format(env_name, args.policy_dist, number, seed))
 
-    state_norm = Normalization(shape=args.state_dim)  # Trick 2:state normalization
-    if args.use_reward_norm:  # Trick 3:reward normalization
+    state_norm = Normalization(shape=args.state_dim)  # Trick 2: 状态归一化 (在线统计均值方差)
+    if args.use_reward_norm:  # Trick 3: 奖励归一化(减均值除方差, 二选一)
         reward_norm = Normalization(shape=1)
-    elif args.use_reward_scaling:  # Trick 4:reward scaling
+    elif args.use_reward_scaling:  # Trick 4: 奖励缩放(只除以折扣回报的 std, 二选一)
         reward_scaling = RewardScaling(shape=1, gamma=args.gamma)
 
-    while total_steps < args.max_train_steps:
-        s = env.reset()
+    while total_steps < args.max_train_steps:  # 主循环: 直到总步数耗尽
+        s = env.reset()  # 新回合初始状态
         if args.use_state_norm:
-            s = state_norm(s)
+            s = state_norm(s)  # 训练时归一化会同时更新统计量
         if args.use_reward_scaling:
-            reward_scaling.reset()
+            reward_scaling.reset()  # 每回合重置折扣累计回报 R=0(Trick 4 的回合边界)
         episode_steps = 0
         done = False
-        while not done:
+        while not done:  # 回合内循环
             episode_steps += 1
-            a, a_logprob = agent.choose_action(s)  # Action and the corresponding log probability
+            a, a_logprob = agent.choose_action(s)  # 按当前策略分布采样动作及其 log π_old(a|s)
             if args.policy_dist == "Beta":
-                action = 2 * (a - 0.5) * args.max_action  # [0,1]->[-max,max]
+                action = 2 * (a - 0.5) * args.max_action  # [0,1]->[-max,max] 区间映射
             else:
                 action = a
-            s_, r, done, _ = env.step(action)
+            s_, r, done, _ = env.step(action)  # 与环境交互一步
 
             if args.use_state_norm:
-                s_ = state_norm(s_)
+                s_ = state_norm(s_)  # 下一状态归一化
             if args.use_reward_norm:
-                r = reward_norm(r)
+                r = reward_norm(r)  # 奖励归一化 (r-μ)/(σ+ε)
             elif args.use_reward_scaling:
-                r = reward_scaling(r)
+                r = reward_scaling(r)  # 奖励缩放 r/(std(R)+ε), R=γR+r 递推
 
-            # When dead or win or reaching the max_episode_steps, done will be Ture, we need to distinguish them;
-            # dw means dead or win,there is no next state s';
-            # but when reaching the max_episode_steps,there is a next state s' actually.
+            # 区分两类"终止":
+            # 死亡/获胜(done 且未到步数上限) → dw=True: 没有下一个状态 s', bootstrap 必须清零
+            # 达到 max_episode_steps → dw=False: 环境其实还在继续, V(s') 应保留(只是仿真被截断)
             if done and episode_steps != args.max_episode_steps:
                 dw = True
             else:
                 dw = False
 
-            # Take the 'action'，but store the original 'a'（especially for Beta）
+            # 注意: 环境执行的是映射后的 'action', 但 buffer 存的是原始 'a'(Beta 时 a∈(0,1)),
+            # 因为更新时 log_prob 是按 (0,1) 支撑集的分布算的, 必须与采样时一致
             replay_buffer.store(s, a, a_logprob, r, s_, dw, done)
-            s = s_
+            s = s_  # 状态前移
             total_steps += 1
 
-            # When the number of transitions in buffer reaches batch_size,then update
+            # buffer 攒满 batch_size 条 → 触发一次 PPO 更新, 然后清零重新采样(on-policy)
             if replay_buffer.count == args.batch_size:
                 agent.update(replay_buffer, total_steps)
                 replay_buffer.count = 0
 
-            # Evaluate the policy every 'evaluate_freq' steps
+            # 每 evaluate_freq 步评估一次策略
             if total_steps % args.evaluate_freq == 0:
                 evaluate_num += 1
-                evaluate_reward = evaluate_policy(args, env_evaluate, agent, state_norm)
+                evaluate_reward = evaluate_policy(args, env_evaluate, agent, state_norm)  # 评估环境跑 3 回合取平均
                 evaluate_rewards.append(evaluate_reward)
                 print("evaluate_num:{} \t evaluate_reward:{} \t".format(evaluate_num, evaluate_reward))
-                writer.add_scalar('step_rewards_{}'.format(env_name), evaluate_rewards[-1], global_step=total_steps)
-                # Save the rewards
+                writer.add_scalar('step_rewards_{}'.format(env_name), evaluate_rewards[-1], global_step=total_steps)  # 写 TensorBoard 曲线
+                # 保存奖励曲线数据
                 if evaluate_num % args.save_freq == 0:
                     np.save('./data_train/PPO_continuous_{}_env_{}_number_{}_seed_{}.npy'.format(args.policy_dist, env_name, number, seed), np.array(evaluate_rewards))
 
@@ -152,6 +159,6 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    env_name = ['BipedalWalker-v3', 'HalfCheetah-v2', 'Hopper-v2', 'Walker2d-v2']
-    env_index = 1
-    main(args, env_name=env_name[env_index], number=1, seed=10)
+    env_name = ['BipedalWalker-v3', 'HalfCheetah-v2', 'Hopper-v2', 'Walker2d-v2']  # 可选训练环境列表
+    env_index = 1  # 当前选 HalfCheetah-v2 (改这里换环境)
+    main(args, env_name=env_name[env_index], number=1, seed=10)  # number 是实验编号(区分重复实验), seed 是随机种子
